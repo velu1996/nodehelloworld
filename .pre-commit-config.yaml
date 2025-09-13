@@ -7,3 +7,9 @@ repos:
         language: system
         types: [javascript]
         args: ["--fix"]
+
+      - id: jsonlint
+        name: jsonlint
+        entry: ./node_modules/.bin/jsonlint
+        language: system
+        files: \.json$  
