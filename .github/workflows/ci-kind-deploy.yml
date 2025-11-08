@@ -1,0 +1,197 @@
+name: CI - Kind Helm PR workflow
+
+on:
+  pull_request:
+    branches: ["master"]
+
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write
+
+concurrency:
+  group: pr-deploy-${{ github.event.number }}
+  cancel-in-progress: true
+
+jobs:
+  lint-chart:
+    name: Helm lint + schema
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      - name: Run helm lint
+        run: |
+          ./scripts/helm_lint.sh ./helm
+
+      - name: Render chart manifests
+        run: helm template ./helm > rendered-manifests.yaml
+
+      - name: Validate rendered manifests with kubeconform
+        uses: instrumenta/kubeconform-action@v1
+        with:
+          files: rendered-manifests.yaml
+          args: -strict
+
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Cache Node modules
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit tests
+        run: npm test -- --runInBand
+
+  security-scan:
+    name: Image security scan (Trivy)
+    runs-on: ubuntu-latest
+    needs: [lint-chart, unit-tests]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build docker image
+        run: |
+          docker build -t node-hello:${{ github.sha }} .
+
+      - name: Run Trivy scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: node-hello:${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Run Trivy scan (table output)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: node-hello:${{ github.sha }}
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+
+  deploy-pr:
+    name: Deploy to ephemeral PR namespace and validate
+    runs-on: ubuntu-latest
+    needs: [lint-chart, unit-tests, security-scan]
+    env:
+      PR_NS: pr-${{ github.event.number }}
+      RELEASE: pr-${{ github.event.number }}
+      IMAGE: node-hello:${{ github.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup kind
+        uses: engineerd/setup-kind@v0.5.0
+
+      - name: Build Docker image
+        run: docker build -t $IMAGE .
+
+      - name: Load image into kind
+        run: |
+          kind load docker-image $IMAGE
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      - name: Install Helm
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      - name: Create namespace (ephemeral PR namespace)
+        run: kubectl create namespace $PR_NS --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Annotate namespace with TTL (60 minutes)
+        run: |
+          EXPIRY=$(date -u -d "+60 minutes" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+60M +%Y-%m-%dT%H:%M:%SZ)
+          kubectl annotate namespace $PR_NS ttl.expires=$EXPIRY --overwrite
+
+      - name: Helm deploy
+        run: |
+          helm upgrade --install $RELEASE ./helm \
+            -n $PR_NS --create-namespace \
+            --wait --timeout 3m \
+            --set image.repository=node-hello,image.tag=${{ github.sha }} \
+            --set resources.limits.memory=256Mi \
+            --set resources.limits.cpu=200m
+
+      - name: Wait for deployments to be available
+        run: kubectl -n $PR_NS wait deployment --all --for=condition=available --timeout=120s
+
+      - name: Inspect pod readiness statuses
+        run: |
+          kubectl -n $PR_NS get pods -o json | jq '.items[] | {name: .metadata.name, statuses: .status.containerStatuses}'
+
+      - name: Smoke test service
+        run: |
+          kubectl -n $PR_NS run curl-test --image=curlimages/curl --restart=Never -- \
+            sh -c "curl -f -m 10 http://$RELEASE:3000/ && echo 'Smoke test passed'"
+          kubectl -n $PR_NS wait pod curl-test --for=condition=Ready --timeout=30s
+          kubectl -n $PR_NS logs curl-test
+          kubectl -n $PR_NS delete pod curl-test
+
+      - name: Comment PR with deployment info
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `✅ **Deployment Successful**\n\n` +
+                    `- **Namespace:** \`pr-${{ github.event.number }}\`\n` +
+                    `- **Image:** \`node-hello:${{ github.sha }}\`\n` +
+                    `- **TTL:** Expires in 60 minutes\n` +
+                    `- **Smoke test:** Passed ✓`
+            })
+
+      - name: Cleanup namespace on failure
+        if: failure()
+        run: |
+          echo "::error::Deployment failed. Collecting diagnostic information..."
+          echo "=== Pod Status ==="
+          kubectl -n $PR_NS get pods -o wide || true
+          echo "=== Pod Logs ==="
+          kubectl -n $PR_NS logs -l app.kubernetes.io/instance=$RELEASE --tail=100 || true
+          echo "=== Pod Descriptions ==="
+          kubectl -n $PR_NS describe pods || true
+          echo "=== Events ==="
+          kubectl -n $PR_NS get events --sort-by='.lastTimestamp' || true
+          kubectl delete namespace $PR_NS --wait=false || true
+
+      - name: Cleanup namespace on success
+        if: success()
+        run: |
+          kubectl delete namespace $PR_NS --wait || true
